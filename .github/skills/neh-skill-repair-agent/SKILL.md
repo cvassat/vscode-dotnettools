@@ -167,7 +167,8 @@ only that a named mechanical invariant now passes.
 | `references/defect-taxonomy.md` | DETERMINISTIC vs JUDGMENT defect classes with severities. |
 | `templates/patch-spec.yaml.tmpl` | Patch specification format. |
 | `templates/repair-report.tmpl.md` | Repair report skeleton. |
-| `scripts/repair_agent.py` | Executable agent loop (scan, patch, verify, package, report). |
+| `scripts/repair_agent.py` | Executable agent loop (scan, patch, verify, package, report). Stdlib-only; runs standalone (report template embedded as fallback). |
+| `scripts/selftest.py` | Section 10 QA table as an executable regression suite (`python3 scripts/selftest.py`; exit 0 = all pass). |
 | `schemas/agent-design-spec.json` | Machine-readable design spec per ai-agent-patterns schema. |
 
 ## 13. Changelog
