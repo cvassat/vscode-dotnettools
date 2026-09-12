@@ -1,6 +1,6 @@
 ---
 name: neh-skill-repair-agent
-version: 1.0.0
+version: 1.1.0
 category: skill-infrastructure
 parent_skills:
 - ai-agent-patterns
@@ -13,7 +13,7 @@ activation_policy: on-demand
 provenance:
   last_modified_by: CJV
   last_modified_on: CLD
-  last_modified_at: 2026-07-24
+  last_modified_at: 2026-09-12
 description: >-
   Task-Automation agent (Plan-and-Execute, Reflection-gated) that detects and
   repairs mechanical defects across the installed NEH skill library, emitting
@@ -118,6 +118,9 @@ python3 scripts/repair_agent.py --root <library-root> --out <output-dir> --scan-
 python3 scripts/repair_agent.py --root <library-root> --out <output-dir> --repair
 ```
 
+`--strict` makes a scan-only run exit nonzero when any defect is found (a CI
+lint gate); `--only unit1,unit2` limits either mode to the named units.
+
 Orchestration caps: one repair pass plus one re-verify per unit; run aborts rather
 than loops. Every tool returns a structured result with an error field; empty-on-failure
 is itself a defect.
@@ -167,10 +170,25 @@ only that a named mechanical invariant now passes.
 | `references/defect-taxonomy.md` | DETERMINISTIC vs JUDGMENT defect classes with severities. |
 | `templates/patch-spec.yaml.tmpl` | Patch specification format. |
 | `templates/repair-report.tmpl.md` | Repair report skeleton. |
-| `scripts/repair_agent.py` | Executable agent loop (scan, patch, verify, package, report). |
+| `scripts/repair_agent.py` | Executable agent loop (scan, patch, verify, package, report). Stdlib-only; runs standalone (report template embedded as fallback). |
+| `scripts/selftest.py` | Section 10 QA table as an executable regression suite (`python3 scripts/selftest.py`; exit 0 = all pass). |
 | `schemas/agent-design-spec.json` | Machine-readable design spec per ai-agent-patterns schema. |
 
 ## 13. Changelog
+
+### v1.1.0 — 12 September 2026
+Hardening release. Packaging preflight matches SKILL.md by exact basename (a
+`MYSKILL.md` lookalike no longer STOPs). Render probe now executes the engine's
+`build(path)` when ReportLab is importable and fails closed on render errors;
+frame geometry is parsed from `Frame(...)` arguments instead of matched loosely.
+A content patch without a bumpable version is refused (S1) rather than emitted
+under the installed version string. Frontmatter parsing prefers PyYAML with the
+stdlib subset parser as fallback. New JUDGMENT detections: GLYPH_MOJIBAKE
+(cp1252-mojibake marker) and U+FFFC under GLYPH_REPLACEMENT_CHAR; four added
+instruction-like patterns. Reserved-word gate matches name tokens, not
+substrings. Later-template patch handles multi-line calls via balanced-paren
+parsing. CLI adds `--strict` and `--only`; a GitHub Actions workflow runs the
+selftest (33 checks) on every change to the skill.
 
 ### v1.0.0 — 24 July 2026
 Initial release. Architecture derived through ai-agent-patterns from the 24-07-2026

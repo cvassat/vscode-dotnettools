@@ -29,12 +29,17 @@ RESERVED_WORDS = {"anthropic", "claude"}
 PROV_SURFACES = {"CLD", "LCL"}
 PROV_FIELDS = ["last_modified_by", "last_modified_on", "last_modified_at"]
 BLACK_SQUARE = "\u25a0"  # escapes, not literals: the agent must scan itself clean
-REPLACEMENT = "\ufffd"
+REPLACEMENT_CHARS = {"\ufffd": "U+FFFD", "\ufffc": "U+FFFC"}
+MOJIBAKE_MARKER = "\u00e2\u20ac"  # UTF-8 punctuation re-decoded as cp1252
 INSTRUCTION_PATTERNS = [
     r"ignore (?:all )?previous instructions",
     r"disregard the above",
     r"you must now",
     r"system prompt override",
+    r"you are now (?:a|an|the)\b",
+    r"override (?:all|your) (?:previous|prior)",
+    r"new instructions\s*:",
+    r"do not tell the user",
 ]
 DETERMINISTIC = "DETERMINISTIC"
 JUDGMENT = "JUDGMENT"
@@ -52,17 +57,44 @@ def defect(unit, code, cls, severity, file, detail):
 
 # ---------------------------------------------------------------- frontmatter
 
-def parse_frontmatter(text):
-    """Minimal YAML-subset parser for skill frontmatter.
+def _normalize_yaml(value):
+    """Coerce PyYAML scalars to the string shapes the checks expect."""
+    if isinstance(value, dict):
+        return {str(k): _normalize_yaml(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_yaml(v) for v in value]
+    if value is None:
+        return ""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.strftime("%Y-%m-%d")
+    return value if isinstance(value, str) else str(value)
 
-    Handles: `key: value`, `key: >-` folded blocks, `key:` + `- item` lists,
-    and one level of nested `key: value` maps (provenance). Returns (dict, None)
-    or (None, error).
-    """
+
+def parse_frontmatter(text):
+    """Parse skill frontmatter: PyYAML when importable, else the minimal
+    stdlib subset parser. Returns (dict, None) or (None, error)."""
     m = re.match(r"\A---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
     if not m:
         return None, "no frontmatter block"
-    fm, lines = {}, m.group(1).split("\n")
+    try:
+        import yaml
+        loaded = yaml.safe_load(m.group(1))
+        if isinstance(loaded, dict):
+            return _normalize_yaml(loaded), None
+    except ImportError:
+        pass
+    except Exception:
+        pass  # malformed for PyYAML too; let the minimal parser report it
+    return _parse_frontmatter_minimal(m.group(1))
+
+
+def _parse_frontmatter_minimal(body):
+    """Minimal YAML-subset parser (stdlib fallback).
+
+    Handles: `key: value`, `key: >-` folded blocks, `key:` + `- item` lists,
+    and one level of nested `key: value` maps (provenance).
+    """
+    fm, lines = {}, body.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -151,7 +183,8 @@ def scan_unit(unit_dir):
     if name and name != unit:
         defects.append(defect(unit, "FM_NAME_MISMATCH", DETERMINISTIC, "S2",
                               "SKILL.md", f"name {name!r} != folder {unit!r}"))
-    if name and any(w in name.lower() for w in RESERVED_WORDS):
+    name_tokens = set(re.split(r"[^a-z0-9]+", name.lower())) if name else set()
+    if name_tokens & RESERVED_WORDS:
         defects.append(defect(unit, "FM_RESERVED_WORD", JUDGMENT, "S2",
                               "SKILL.md", f"reserved word in name {name!r}"))
     desc = fm.get("description", "")
@@ -193,9 +226,15 @@ def scan_unit(unit_dir):
         if BLACK_SQUARE in content:
             defects.append(defect(unit, "GLYPH_BLACK_SQUARE", DETERMINISTIC, "S0",
                                   rel, f"{content.count(BLACK_SQUARE)} x U+25A0"))
-        if REPLACEMENT in content:
+        hits = [f"{content.count(ch)} x {label}"
+                for ch, label in REPLACEMENT_CHARS.items() if ch in content]
+        if hits:
             defects.append(defect(unit, "GLYPH_REPLACEMENT_CHAR", JUDGMENT, "S2",
-                                  rel, f"{content.count(REPLACEMENT)} x U+FFFD"))
+                                  rel, ", ".join(hits)))
+        if MOJIBAKE_MARKER in content:
+            defects.append(defect(unit, "GLYPH_MOJIBAKE", JUDGMENT, "S2", rel,
+                                  f"{content.count(MOJIBAKE_MARKER)} x mojibake marker "
+                                  "(UTF-8 punctuation re-decoded as cp1252)"))
 
     # Instruction-like text aimed at the agent — data, never executed
     body = text[text.find("---", 3) + 3:] if "---" in text[3:] else text
@@ -210,18 +249,36 @@ def scan_unit(unit_dir):
 
 
 def _engine_scripts(unit_dir):
-    return [p for p in sorted(unit_dir.rglob("*.py"))
-            if is_text_file(p)
-            and "BaseDocTemplate" in p.read_text(encoding="utf-8", errors="replace")
-            and "PageTemplate" in p.read_text(encoding="utf-8", errors="replace")]
+    """[(path, source)] for each ReportLab build script in the unit (read once)."""
+    scripts = []
+    for p in sorted(unit_dir.rglob("*.py")):
+        if not is_text_file(p):
+            continue
+        src = p.read_text(encoding="utf-8", errors="replace")
+        if "BaseDocTemplate" in src and "PageTemplate" in src:
+            scripts.append((p, src))
+    return scripts
+
+
+def _template_ids(src):
+    return re.findall(r"PageTemplate\s*\(\s*id\s*=\s*['\"](\w+)['\"]", src)
+
+
+def _frame_geometry_ok(src):
+    """True when some Frame(...) call carries both 72.0 and 540.0 as arguments —
+    parsed from the call, not matched anywhere in the file."""
+    for args in re.findall(r"Frame\s*\(([^)]*)\)", src):
+        nums = {float(n) for n in re.findall(r"\d+(?:\.\d+)?", args)}
+        if 72.0 in nums and 540.0 in nums:
+            return True
+    return False
 
 
 def scan_engine(unit_dir):
     unit, defects = unit_dir.name, []
-    for script in _engine_scripts(unit_dir):
-        src = script.read_text(encoding="utf-8", errors="replace")
+    for script, src in _engine_scripts(unit_dir):
         rel = str(script.relative_to(unit_dir))
-        ids = re.findall(r"PageTemplate\s*\(\s*id\s*=\s*['\"](\w+)['\"]", src)
+        ids = _template_ids(src)
         if "First" in ids and "Later" not in ids:
             cls = DETERMINISTIC if len(ids) == 1 else JUDGMENT
             defects.append(defect(unit, "RENDER_MISSING_LATER", cls, "S2", rel,
@@ -230,46 +287,83 @@ def scan_engine(unit_dir):
     return defects
 
 
-def scan_library(root):
-    """Tool: enumerate units and build the defect register."""
+def scan_library(root, only=None):
+    """Tool: enumerate units and build the defect register. `only` limits the
+    scan to the named unit folders."""
     root = Path(root)
     if not root.is_dir():
         return result(False, error=f"library root not a directory: {root}")
     units = sorted(d for d in root.iterdir()
-                   if d.is_dir() and not d.name.startswith("."))
+                   if d.is_dir() and not d.name.startswith(".")
+                   and (only is None or d.name in only))
     if not units:
-        return result(False, error=f"no skill folders under {root}")
+        return result(False, error=f"no matching skill folders under {root}")
     register = {u.name: scan_unit(u) for u in units}
     return result(True, {"units": [u.name for u in units], "register": register})
 
 
 # -------------------------------------------------------------------- probes
 
+def _live_render(script_path):
+    """Execute the engine's build(path) against a temp target. Returns None on a
+    rendered PDF, else a failure string. Only called when ReportLab imports."""
+    import importlib.util
+    import tempfile
+    spec = importlib.util.spec_from_file_location("_neh_probe_engine", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    build = getattr(module, "build", None)
+    if not callable(build):
+        return "skipped: no build(path) entry point"
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "probe.pdf"
+        doc = build(str(out))
+        if hasattr(doc, "build") and not out.exists():
+            return "skipped: build(path) returned an unbuilt doc"
+        data = out.read_bytes() if out.exists() else b""
+    if not data.startswith(b"%PDF"):
+        return "FAIL: build(path) produced no PDF"
+    return None
+
+
 def render_probe(unit_dir):
-    """Tool: static render verification for engine units (live render only when
-    ReportLab is importable; the result records which mode ran)."""
+    """Tool: render verification for engine units. Static checks always run
+    (template inventory + Frame geometry); when ReportLab is importable the
+    engine's build(path) is also executed and must emit a PDF — a live failure
+    fails the probe. The result records which mode actually ran."""
     scripts = _engine_scripts(unit_dir)
     if not scripts:
         return result(False, error="not an engine unit (no ReportLab build found)")
-    checks = []
-    for script in scripts:
-        src = script.read_text(encoding="utf-8", errors="replace")
-        ids = re.findall(r"PageTemplate\s*\(\s*id\s*=\s*['\"](\w+)['\"]", src)
-        geometry = "72.0" in src and "540.0" in src
-        checks.append({
-            "script": str(script.relative_to(unit_dir)),
-            "templates": ids,
-            "has_first_and_later": "First" in ids and "Later" in ids,
-            "geometry_72_540": geometry,
-        })
     try:
         import reportlab  # noqa: F401
-        mode = "live-capable"
+        live = True
     except ImportError:
-        mode = "static"
-    ok = all(c["has_first_and_later"] and c["geometry_72_540"] for c in checks)
-    return result(ok, {"mode": mode, "checks": checks},
-                  None if ok else "probe FAIL: template inventory or geometry")
+        live = False
+    checks, live_failures = [], []
+    for script, src in scripts:
+        rel = str(script.relative_to(unit_dir))
+        ids = _template_ids(src)
+        entry = {
+            "script": rel,
+            "templates": ids,
+            "has_first_and_later": "First" in ids and "Later" in ids,
+            "geometry_72_540": _frame_geometry_ok(src),
+        }
+        if live:
+            try:
+                outcome = _live_render(script)
+            except Exception as exc:  # engine raised: probe must fail closed
+                outcome = f"FAIL: {type(exc).__name__}: {exc}"
+            entry["live_render"] = outcome or "PASS"
+            if outcome and outcome.startswith("FAIL"):
+                live_failures.append(f"{rel}: {outcome}")
+        checks.append(entry)
+    ok = (all(c["has_first_and_later"] and c["geometry_72_540"] for c in checks)
+          and not live_failures)
+    detail = "; ".join(live_failures) if live_failures else \
+        "probe FAIL: template inventory or geometry"
+    return result(ok, {"mode": "live" if live else "static", "checks": checks},
+                  None if ok else detail)
 
 
 def rescan_probe(unit_dir, patched_codes):
@@ -310,26 +404,55 @@ def _bump_patch(version):
     return f"{major}.{minor}.{int(patch) + 1}"
 
 
+def _balanced_end(src, open_idx):
+    """Index just past the (...)/[...] group opening at open_idx, or -1.
+    Heuristic: does not account for brackets inside string literals — a
+    mis-parse simply fails the patch, which escalates (fail-closed)."""
+    pairs = {"(": ")", "[": "]"}
+    opener = src[open_idx]
+    closer = pairs[opener]
+    depth = 0
+    for i in range(open_idx, len(src)):
+        if src[i] == opener:
+            depth += 1
+        elif src[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
 def patch_clone_later_template(script_path):
-    """Clone the single First PageTemplate registration as Later (same frame,
-    same onPage hook) and register it. Returns error string or None."""
+    """Clone the First PageTemplate registration as Later (same frames, same
+    onPage hook) and register it. Handles multi-line calls via balanced-paren
+    parsing. Returns error string or None."""
     src = script_path.read_text(encoding="utf-8")
-    m = re.search(r"^(\s*)(\w+)\s*=\s*PageTemplate\s*\(\s*id\s*=\s*['\"]First['\"]"
-                  r"(.*?)\)\s*$", src, re.MULTILINE | re.DOTALL)
-    if not m:
-        return "First PageTemplate assignment not found in known pattern"
-    indent, var, args = m.groups()
-    later_var = var.replace("first", "later").replace("First", "Later")
-    if later_var == var:
-        later_var = var + "_later"
-    clone = f"{indent}{later_var} = PageTemplate(id='Later'{args})"
-    src = src[:m.end()] + "\n" + clone + src[m.end():]
-    reg = re.search(r"addPageTemplates\s*\(\s*\[([^\]]*)\]", src)
-    if not reg:
-        return "addPageTemplates registration not found"
-    src = src[:reg.end(1)] + f", {later_var}" + src[reg.end(1):]
-    script_path.write_text(src, encoding="utf-8")
-    return None
+    for m in re.finditer(r"^([ \t]*)(\w+)\s*=\s*PageTemplate\s*(\()",
+                         src, re.MULTILINE):
+        end = _balanced_end(src, m.start(3))
+        if end < 0:
+            continue
+        call = src[m.start(3):end]
+        if not re.search(r"id\s*=\s*['\"]First['\"]", call):
+            continue
+        indent, var = m.group(1), m.group(2)
+        later_var = var.replace("first", "later").replace("First", "Later")
+        if later_var == var:
+            later_var = var + "_later"
+        later_call = re.sub(r"(id\s*=\s*['\"])First(['\"])", r"\g<1>Later\g<2>",
+                            call, count=1)
+        src = (src[:end] + f"\n{indent}{later_var} = PageTemplate{later_call}"
+               + src[end:])
+        reg = re.search(r"addPageTemplates\s*\(\s*(\[)", src)
+        if not reg:
+            return "addPageTemplates registration not found"
+        list_end = _balanced_end(src, reg.start(1))
+        if list_end < 0:
+            return "addPageTemplates list not parseable"
+        src = src[:list_end - 1] + f", {later_var}" + src[list_end - 1:]
+        script_path.write_text(src, encoding="utf-8")
+        return None
+    return "First PageTemplate assignment not found in known pattern"
 
 
 def apply_patch(unit_dir, spec, run_date):
@@ -443,14 +566,15 @@ def package_skill(unit_dir, packages_dir):
         tops = {n.split("/", 1)[0] for n in names}
         if tops != {name}:
             stops.append(f"top-level folders {sorted(tops)} != [{name}]")
-        skill_mds = [n for n in names if n.endswith("SKILL.md")]
+        skill_mds = [n for n in names if n.split("/")[-1] == "SKILL.md"]
         if len(skill_mds) != 1 or skill_mds[0] != f"{name}/SKILL.md":
             stops.append(f"SKILL.md count/placement: {skill_mds}")
         if any(n.lower().endswith(".pdf") for n in names):
             stops.append("PDF inside archive")
-        else:
+        elif f"{name}/SKILL.md" in names:
             md = zf.read(f"{name}/SKILL.md").decode("utf-8", errors="replace")
-            if BLACK_SQUARE in md or REPLACEMENT in md:
+            if (BLACK_SQUARE in md or MOJIBAKE_MARKER in md
+                    or any(ch in md for ch in REPLACEMENT_CHARS)):
                 stops.append("glyph in packaged SKILL.md")
     if stops:
         pkg.unlink()
@@ -461,10 +585,86 @@ def package_skill(unit_dir, packages_dir):
 
 # ------------------------------------------------------------------- report
 
+# Fallback copy of templates/repair-report.tmpl.md so the script also runs
+# standalone (copied out of the skill folder). The on-disk template wins when
+# present; keep the two in sync when editing either.
+EMBEDDED_REPORT_TMPL = """\
+# NEH Skill-Library Repair Report
+
+- **Run date:** {run_date}
+- **Library root:** `{root}` (opened read-only)
+- **Output dir:** `{out}`
+- **Mode:** {mode}
+- **Units scanned:** {units_scanned}
+- **Result:** {summary_line}
+
+> Scope note: this report asserts only that named mechanical invariants pass or fail.
+> It makes no brand, clinical, legal, or regulatory compliance assertions.
+
+## 1. Defect register
+
+| Unit | Code | Class | Severity | Evidence |
+|---|---|---|---|---|
+{register_rows}
+
+## 2. Patches applied
+
+| Patch ID | Unit | Defect | Edit | Version | Probe |
+|---|---|---|---|---|---|
+{patch_rows}
+
+## 3. Verification probes
+
+| Unit | Probe | Mode | Result | Detail |
+|---|---|---|---|---|
+{probe_rows}
+
+## 4. Packages emitted
+
+| Package | Unit | Version | Preflight | Exclusions |
+|---|---|---|---|---|
+{package_rows}
+
+## 5. Escalations (Medical Director)
+
+JUDGMENT-class defects. None of these were patched.
+
+| Unit | Code | Severity | Evidence | Why judgment |
+|---|---|---|---|---|
+{escalation_rows}
+
+## 6. Pipeline incidents (S1)
+
+Probe failures, reverts, packaging STOPs, empty tool results.
+
+{incident_rows}
+
+## 7. Save-back — human action required
+
+Nothing in this run wrote to the live library. To install the repaired packages:
+
+1. **Verify first:** for each unit below, confirm the installed on-disk version still
+   matches the "before" version in this report. If it does not, the library drifted
+   since this scan — re-run the scan instead of saving back.
+2. Save each `.skill` package from `{out}/packages/` into the library.
+3. After save-back is confirmed by an on-disk version check, hand wiring to
+   **neh-skill-registrar** (router/graph) and file this report with
+   **neh-drift-sentinel**.
+
+| Unit | Before | After | Package |
+|---|---|---|---|
+{saveback_rows}
+
+---
+Run log: `{run_log_path}` (episodic JSON, same run).
+"""
+
+
 def write_report(run, out_dir):
     """Tool: render the report template and the episodic JSON run log."""
     tmpl_path = Path(__file__).resolve().parent.parent / "templates" / "repair-report.tmpl.md"
-    tmpl = tmpl_path.read_text(encoding="utf-8")
+    tmpl = (tmpl_path.read_text(encoding="utf-8") if tmpl_path.is_file()
+            else EMBEDDED_REPORT_TMPL)
 
     def rows(items, fmt, empty):
         return "\n".join(fmt(i) for i in items) if items else empty
@@ -515,7 +715,12 @@ def main(argv=None):
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--scan-only", action="store_true")
     mode.add_argument("--repair", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="scan-only: exit 1 when any defect is found (CI gate)")
+    ap.add_argument("--only", metavar="UNIT[,UNIT...]",
+                    help="limit the run to the named unit folders")
     args = ap.parse_args(argv)
+    only = set(args.only.split(",")) if args.only else None
 
     run_date = datetime.date.today().isoformat()
     out_dir = Path(args.out)
@@ -525,7 +730,7 @@ def main(argv=None):
            "register": {}, "patches": [], "probes": [], "packages": [],
            "escalations": [], "incidents": [], "saveback": [], "summary": ""}
 
-    scan = scan_library(args.root)
+    scan = scan_library(args.root, only=only)
     if not scan["ok"]:
         run["summary"] = f"ABORT: {scan['error']}"
         run["incidents"].append(f"S1 scan_library: {scan['error']}")
@@ -543,7 +748,7 @@ def main(argv=None):
                           f"{len({d['unit'] for d in all_defects})} unit(s); no patches applied (scan-only)")
         wr = write_report(run, out_dir)
         print(f"{run['summary']}\nreport: {wr['data']['report']}")
-        return 0
+        return 1 if args.strict and all_defects else 0
 
     # Repair mode: work on copies, never the live library.
     work = out_dir / "work"
@@ -559,13 +764,23 @@ def main(argv=None):
         if any(d["code"] in ("TREE_NO_SKILL_MD", "FM_UNPARSEABLE") for d in defects):
             continue  # precedence rule 2
         src = Path(args.root) / unit
+        fm, _ = parse_frontmatter((src / "SKILL.md").read_text(encoding="utf-8"))
+        before_v = fm.get("version", "?")
+        # A content patch must carry a version bump: never emit a changed
+        # package under the installed version string. PDF-only exclusion
+        # keeps the version (nothing in the content changes).
+        content_codes = [d["code"] for d in det if d["code"] != "TREE_PDF_PRESENT"]
+        if content_codes and not (re.fullmatch(r"\d+\.\d+\.\d+", before_v)
+                                  or _normalize_version(before_v)):
+            run["incidents"].append(
+                f"S1 {unit}: version {before_v!r} not bumpable; deterministic "
+                f"defects {content_codes} left unpatched")
+            continue
         wcopy, pcopy = work / unit, pristine / unit
         for c in (wcopy, pcopy):
             if c.exists():
                 shutil.rmtree(c)
             shutil.copytree(src, c)
-        fm, _ = parse_frontmatter((src / "SKILL.md").read_text(encoding="utf-8"))
-        before_v = fm.get("version", "?")
 
         patched_codes, failed = [], False
         for seq, d in enumerate(det, 1):  # one repair pass per unit — no retries
