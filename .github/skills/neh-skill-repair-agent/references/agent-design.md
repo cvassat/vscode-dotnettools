@@ -54,11 +54,17 @@ provenance checks, and engine detection; emits the defect register.
 output directories.
 
 ### `render_probe(unit)`
-Static verification of a ReportLab engine script: PageTemplate inventory (`First` +
-`Later`), 72.0/540.0 frame geometry, decoration hook on every template, font
-references vs the brand allowlist. Runs a live import-and-render only when ReportLab
-is installed; otherwise records `mode: static` in its result — it never silently
-upgrades a static pass into a claim about rendered pages.
+Verification of a ReportLab engine script in two layers. Static checks always run:
+PageTemplate inventory (`First` + `Later`) and 72.0/540.0 geometry parsed from the
+`Frame(...)` call arguments (never matched loosely against the whole file). When
+ReportLab is importable, the probe additionally executes the engine's
+`build(path)` entry point against a temporary target and requires a real PDF to
+come back — an exception or an empty output fails the probe (fail-closed); an
+engine without a `build(path)` entry point records the live layer as skipped.
+The result's `mode` field states which layers actually ran (`live` or `static`),
+so a static PASS is never misread as render evidence. The live layer executes
+the engine script; the library being probed is the practice's own code, and any
+misbehavior surfaces as a probe FAIL, never as a patch or a package.
 **WHEN NOT TO USE:** non-engine units (no ReportLab build present) — a probe on them
 is meaningless and its PASS would be misread as render evidence.
 

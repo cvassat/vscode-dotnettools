@@ -65,7 +65,8 @@ def build_fixture_library(root):
     (d / "assets" / "brand.jpg").write_bytes(
         b"\xff\xd8\xff\xe0\x00JFIF" + "\u25a0\ufffd".encode() + b"\xff\xd9")
 
-    # Scenario: engine missing the Later PageTemplate. The ReportLab tokens are
+    # Scenario: engine missing the Later PageTemplate, written as a MULTI-LINE
+    # call to exercise the balanced-paren patcher. The ReportLab tokens are
     # split in THIS source so the scanner never classifies the selftest itself
     # as an engine — only the written fixture file carries them contiguously.
     bdt, pt = "BaseDoc" + "Template", "Page" + "Template"
@@ -78,8 +79,14 @@ def build_fixture_library(root):
         "def build(path):\n"
         f"    doc = {bdt}(path)\n"
         "    frame = Frame(72.0, 72.0, 468.0, 540.0, id='body')\n"
-        f"    first_tmpl = {pt}(id='First', frames=[frame], onPage=decorate)\n"
-        f"    doc.add{pt}s([first_tmpl])\n"
+        f"    first_tmpl = {pt}(\n"
+        "        id='First',\n"
+        "        frames=[frame],\n"
+        "        onPage=decorate,\n"
+        "    )\n"
+        f"    doc.add{pt}s([\n"
+        "        first_tmpl,\n"
+        "    ])\n"
         "    return doc\n", encoding="utf-8")
 
     # Scenario: frontmatter name mismatching folder
@@ -88,15 +95,27 @@ def build_fixture_library(root):
     # Scenario: description over 1,024 chars
     unit("long-desc", desc=("An exhaustively long description. " * 40).strip())
 
-    # Scenario: skill containing a PDF
+    # Scenario: skill containing a PDF; also carries a MYSKILL.md lookalike \u2014
+    # the packaging preflight must not miscount it as a second SKILL.md
     d = unit("pdf-skill")
     (d / "output.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (d / "MYSKILL.md").write_text("# Not a manifest\n", encoding="utf-8")
 
     # Scenario: U+25A0 glyph corruption in a text artifact
     d = unit("glyph-skill")
     (d / "references").mkdir()
     (d / "references" / "guide.md").write_text(
         "# Guide\n\n\u25a0 item one\n\u25a0 item two\n", encoding="utf-8")
+
+    # Scenario: mojibake corruption (UTF-8 re-decoded as cp1252) \u2014 JUDGMENT
+    d = unit("mojibake-skill")
+    (d / "references").mkdir()
+    (d / "references" / "notes.md").write_text(
+        "# Notes\n\nthe patient\u00e2\u20ac\u2122s choice\n", encoding="utf-8")
+
+    # Scenario: name containing a reserved word only as a substring token \u2014
+    # token-boundary matching must NOT flag it
+    unit("claudette-tools")
 
 
 def codes_for(register, unit):
@@ -127,6 +146,17 @@ def main():
           all(d["class"] == "JUDGMENT" for d in reg["long-desc"]))
     check("PDF presence detected", codes_for(reg, "pdf-skill") == ["TREE_PDF_PRESENT"])
     check("glyph corruption detected", codes_for(reg, "glyph-skill") == ["GLYPH_BLACK_SQUARE"])
+    check("mojibake detected as JUDGMENT",
+          codes_for(reg, "mojibake-skill") == ["GLYPH_MOJIBAKE"]
+          and all(d["class"] == "JUDGMENT" for d in reg["mojibake-skill"]))
+    check("reserved word matched on tokens, not substrings (claudette-tools clean)",
+          codes_for(reg, "claudette-tools") == [], str(codes_for(reg, "claudette-tools")))
+    rc = repair_agent.main(["--root", str(lib), "--out", str(tmp / "scan-strict"),
+                            "--scan-only", "--strict"])
+    check("--strict scan exits 1 on defects", rc == 1)
+    rc = repair_agent.main(["--root", str(lib), "--out", str(tmp / "scan-only-unit"),
+                            "--scan-only", "--only", "good-skill", "--strict"])
+    check("--only limits the scan (good-skill alone is clean)", rc == 0)
 
     print("repair mode:")
     rc = repair_agent.main(["--root", str(lib), "--out", str(tmp / "repair"), "--repair"])
@@ -156,12 +186,37 @@ def main():
           any(d["unit"] == "long-desc" for d in run["escalations"])
           and "long-desc" not in pkgs
           and not any(p["unit"] == "long-desc" for p in run["patches"]))
+    check("mojibake escalated, never patched or packaged",
+          any(d["unit"] == "mojibake-skill" for d in run["escalations"])
+          and "mojibake-skill" not in pkgs
+          and not any(p["unit"] == "mojibake-skill" for p in run["patches"]))
+    with zipfile.ZipFile(pkgs["pdf-skill"]["package"]) as zf:
+        check("MYSKILL.md lookalike did not trip the SKILL.md preflight",
+              "pdf-skill/MYSKILL.md" in zf.namelist())
     check("live library untouched (name)",
           "name: old-name" in (lib / "wrong-name" / "SKILL.md").read_text(encoding="utf-8"))
     check("live library untouched (glyphs)",
           "\u25a0" in (lib / "glyph-skill" / "references" / "guide.md").read_text(encoding="utf-8"))
     check("every patched unit bumped to 1.0.1",
           all(p["version"] == "1.0.1" for p in run["patches"]))
+
+    print("unbumpable-version guard:")
+    badlib = tmp / "badlib"
+    d = badlib / "badver-skill"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        frontmatter("badver-skill").replace("version: 1.0.0", "version: unknown"),
+        encoding="utf-8")
+    (d / "notes.md").write_text("\u25a0 corrupted bullet\n", encoding="utf-8")
+    rc = repair_agent.main(["--root", str(badlib), "--out", str(tmp / "badrun"),
+                            "--repair"])
+    badrun = json.loads((tmp / "badrun" / "run-log.json").read_text(encoding="utf-8"))
+    check("unbumpable version -> S1 incident, exit 2",
+          rc == 2 and any("not bumpable" in i for i in badrun["incidents"]))
+    check("unbumpable unit not patched or packaged",
+          not badrun["patches"] and not badrun["packages"])
+    check("unbumpable unit's source untouched",
+          "\u25a0" in (d / "notes.md").read_text(encoding="utf-8"))
 
     print("zero-defect run:")
     rc = repair_agent.main(["--root", str(clean_lib), "--out", str(tmp / "clean"), "--repair"])

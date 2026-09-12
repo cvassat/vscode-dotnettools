@@ -43,7 +43,7 @@ Required fields (7): `name`, `version`, `category`, `parent_skills`,
 | FM_UNPARSEABLE | JUDGMENT | S2 | Frontmatter block missing or not parseable. | Escalate. |
 | FM_MISSING_FIELD | JUDGMENT | S2 | A required field is absent. | Escalate — the agent cannot invent category, parents, or description. |
 | FM_NAME_MISMATCH | DETERMINISTIC | S2 | `name` differs from the folder name. | Patch: set `name` to the folder name (the folder is the installed identity; the 24-07-2026 session-start-hook fix is the precedent). |
-| FM_RESERVED_WORD | JUDGMENT | S2 | `name` contains a reserved word (`anthropic`, `claude`). | Escalate — renaming a skill is a registry decision. |
+| FM_RESERVED_WORD | JUDGMENT | S2 | A hyphen-delimited token of `name` equals a reserved word (`anthropic`, `claude`) — token match, never substring, so e.g. `claudette-tools` is clean. | Escalate — renaming a skill is a registry decision. |
 | FM_DESC_TOO_SHORT | JUDGMENT | S1 | `description` under 200 characters. | Escalate — expanding a description is authorial. |
 | FM_DESC_TOO_LONG | JUDGMENT | S1 | `description` over 1,024 characters. | Escalate — fitting is author-confirmed, never silent. |
 | FM_BAD_VERSION | DETERMINISTIC | S2 | `version` is not `MAJOR.MINOR.PATCH`. | Patch only the trivial normalizations (strip `v` prefix, pad missing `.0` segments); anything else escalates. |
@@ -58,7 +58,8 @@ a glyph inside a binary asset is not a defect.
 | Code | Class | Severity | Detection | Disposition |
 |---|---|---|---|---|
 | GLYPH_BLACK_SQUARE | DETERMINISTIC | S0 | U+25A0 BLACK SQUARE in a text artifact — the known bullet-corruption artifact from the 24-07-2026 session. | Patch: replace each U+25A0 with `-` (hyphen bullet). Re-scan probe must show zero hits. |
-| GLYPH_REPLACEMENT_CHAR | JUDGMENT | S2 | U+FFFD REPLACEMENT CHARACTER in a text artifact. | Escalate — the original byte sequence is unrecoverable; any substitution invents content. |
+| GLYPH_REPLACEMENT_CHAR | JUDGMENT | S2 | U+FFFD REPLACEMENT CHARACTER or U+FFFC OBJECT REPLACEMENT CHARACTER in a text artifact. | Escalate — the original byte sequence is unrecoverable; any substitution invents content. |
+| GLYPH_MOJIBAKE | JUDGMENT | S2 | The U+00E2 U+20AC marker sequence in a text artifact — UTF-8 punctuation re-decoded as cp1252 (smart quotes, dashes, ellipses turned to three-character garbage). | Escalate — reconstructing the intended punctuation is inference, not mechanics. |
 
 ### Provenance (neh-file-governance §1.8)
 
@@ -104,3 +105,8 @@ brand treatment and the 72.0/540.0 frame.
 2. A unit with TREE_NO_SKILL_MD or FM_UNPARSEABLE is skipped entirely after logging —
    nothing downstream is meaningful.
 3. Probe failure always wins over patch success: revert, S1, do not package.
+4. A content patch must carry a version bump. If the unit's version cannot be
+   bumped (invalid and not trivially normalizable), its deterministic content
+   defects are left unpatched with an S1 incident — a changed package is never
+   emitted under the installed version string. PDF-only exclusion is exempt:
+   the content is unchanged, so the version is kept by design.
